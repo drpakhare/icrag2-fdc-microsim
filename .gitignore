@@ -7,7 +7,6 @@
 
 # Posit Connect deployment artifacts
 rsconnect/
-manifest.json
 
 # OS files
 .DS_Store
