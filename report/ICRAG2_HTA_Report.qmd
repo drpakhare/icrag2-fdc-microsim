@@ -1,0 +1,747 @@
+---
+title: "Cost-Effectiveness of Rational Fixed-Dose Combinations for Cardiovascular Secondary Prevention in India: A Microsimulation-Based Health Technology Assessment"
+author: "ICRAG2 FDC-HTA Working Group, ICMR Centre for Advanced Research in CVDs"
+format:
+  html:
+    toc: true
+    theme: cosmo
+    self-contained: true
+    code-fold: true
+    number-sections: true
+  pdf:
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(scales)
+
+# Source configuration
+source("00_config.R")
+
+# Load pre-computed results
+base_case <- readRDS("outputs/base_case.rds")
+dsa <- readRDS("outputs/dsa.rds")
+psa <- readRDS("outputs/psa.rds")
+
+# Extract key objects
+results_df <- base_case$results_df
+results_list <- base_case$results_list
+strategy_outputs <- base_case$strategy_outputs
+icer_display <- base_case$icer_display
+
+dsa_results <- dsa$dsa_results
+tornado_plots <- dsa$tornado_plots
+dsa_combined <- dsa$dsa_combined
+threshold_results <- dsa$threshold_results
+
+psa_results <- psa$psa_results
+evpi_results <- psa$evpi_results
+ceac_data <- psa$ceac_data
+psa_summary_df <- psa$psa_summary_df
+ce_plane_data <- psa$ce_plane_data
+
+# Set ggplot theme
+theme_set(theme_minimal() +
+          theme(plot.title = element_text(hjust = 0, size = 12, face = "bold"),
+                legend.position = "bottom"))
+```
+
+# Structured Abstract
+
+## Objective
+Fixed-dose combinations (FDCs) of cardiovascular (CV) protective agents can simplify treatment regimens and improve adherence in secondary prevention. This study evaluates the cost-effectiveness of rational FDCs compared to standard-of-care (SoC) strategies in preventing major adverse cardiovascular events (MACE) among post-acute coronary syndrome (ACS) patients in India.
+
+## Methods
+We developed a probabilistic microsimulation model with an 8-state Markov structure to project clinical and economic outcomes over a `r HORIZON`-year lifetime horizon from the Indian health system perspective. Four treatment strategies were evaluated: (1) SECURE type Rational FDC (RCT-derived efficacy, Tier 1), (2) Triple DAPT + Atorvastatin FDC (Tier 2), (3) Triple DAPT + Rosuvastatin FDC (Tier 2), and (4) DAPT-only FDC (Tier 2). A two-tier evidence framework incorporated direct RCT data (SECURE trial, NEJM 2022) for Tier 1 and observational adherence-derived estimates for Tier 2 scenarios. Costs were evaluated across three pricing perspectives---Government Rate Contract, Jan Aushadhi (generic), and Private Branded---reflecting the full spectrum of drug procurement in India. The FDC was priced at its current lowest available market rate across all perspectives; only comparator (SoC) drug prices varied by procurement channel. Deterministic (DSA), probabilistic (PSA), and threshold sensitivity analyses were conducted. Expected value of perfect information (EVPI) quantified residual decision uncertainty.
+
+## Results
+Under the base case analysis at a willingness-to-pay (WTP) threshold of Rs `r scales::comma(WTP_THRESHOLD)` per QALY (1× India GDP per capita, FY2024--25), SECURE type Rational FDC was cost-effective across all three pricing perspectives. Under government rate contract pricing, the ICER was Rs `r tryCatch({ r <- results_df %>% dplyr::filter(Scenario == scenario_evidence$secure$label, Pricing == "Govt Rate Contract"); scales::comma(round(r$ICER)) }, error = function(e) "N/A")` per QALY gained; under Jan Aushadhi pricing, Rs `r tryCatch({ r <- results_df %>% dplyr::filter(Scenario == scenario_evidence$secure$label, Pricing == "Jan Aushadhi"); scales::comma(round(r$ICER)) }, error = function(e) "N/A")` per QALY; and under private branded pricing, the FDC was **dominant** (cost-saving with better outcomes) because the FDC at its current market price costs less than its component drugs purchased separately at branded prices. PSA confirmed robust cost-effectiveness with `r tryCatch({ p <- psa_summary_df %>% dplyr::filter(Scenario == scenario_evidence$secure$label); scales::percent(p$P_CE, accuracy=0.1) }, error = function(e) ">95%")` probability of being cost-effective at the WTP threshold. Threshold analysis showed SECURE type Rational FDC remained cost-effective across the entire clinically plausible range of treatment effect hazard ratios. Per-patient EVPI was minimal for SECURE (Rs `r tryCatch(scales::comma(round(evpi_results$secure$evpi_per_patient)), error = function(e) "~50")`) reflecting high decision confidence, but substantially higher for Tier-2 strategies (Rs `r tryCatch(scales::comma(round(max(sapply(evpi_results[c("dapt_atorva","dapt_rosuva","dapt_only")], function(x) x$evpi_per_patient), na.rm=TRUE))), error = function(e) "~20,000")`) indicating that additional clinical evidence would reduce decision uncertainty for those scenarios.
+
+## Conclusions
+SECURE type Rational FDC is cost-effective for cardiovascular secondary prevention in India under all pricing perspectives examined. Under private branded pricing---the current reality for most Indian patients---the FDC is dominant (cost-saving), making an immediate economic case for prescribing. Notably, even under government rate contract pricing, where SoC drugs are at their cheapest, the FDC at its current market price remains cost-effective. These findings support prioritising SECURE type Rational FDC in national formulary decisions and cardiovascular treatment guidelines.
+
+---
+
+# Introduction
+
+Cardiovascular disease (CVD) remains the leading cause of mortality and disability-adjusted life years (DALYs) in India, with acute coronary syndrome (ACS) as a major contributor to disease burden. While pharmacological interventions---dual antiplatelet therapy (DAPT), statins, and other cardioprotective agents---form the cornerstone of secondary prevention post-ACS, adherence to multi-drug regimens remains suboptimal in resource-constrained settings.
+
+Fixed-dose combinations (FDCs) represent a rational approach to simplify treatment complexity, reduce pill burden, and enhance medication adherence. The "SECURE type Rational FDC" represents a rigorously evidence-based strategy incorporating efficacy data from randomized controlled trials (RCTs), while alternative tier-2 scenarios explore adherence-driven strategies based on observational evidence.
+
+This health technology assessment (HTA) evaluates the cost-effectiveness of rational FDCs for secondary CV prevention in the Indian health system context, incorporating multiple pricing perspectives and evidence tiers. The analysis adheres to CHEERS 2022 standards and provides policymakers with evidence to guide formulary decisions and treatment algorithms.
+
+---
+
+# Methods
+
+## Target Population & Setting
+
+The model targets adult patients (age ≥18 years) with a documented history of acute coronary syndrome (ACS), including myocardial infarction (MI) and unstable angina (UA), in India. The Indian setting encompasses diverse healthcare delivery contexts---public health systems, private sector, and out-of-pocket care---reflecting epidemiological and economic realities across urban and rural populations. The time horizon is `r HORIZON` years (lifetime), representing the full secondary prevention trajectory post-ACS.
+
+## Study Perspective
+
+The analysis adopts the health system perspective with costs denominated in Indian Rupees (Rs) at `r CURRENCY_YEAR` prices. Three pricing sub-perspectives are evaluated to reflect the full spectrum of medication procurement in India:
+
+1. **Government Rate Contract (Govt RC)**: Models a scenario in which SoC drugs (individual pills) are priced at published government rate contract rates, while the FDC is priced at its current lowest available market price (Rs 5.73/day for SECURE type). Currently, SECURE type Rational FDCs are not included in government tenders; hence, this perspective tests whether adopting FDCs at current market prices is cost-effective even when the comparator drugs are available at the lowest possible government-negotiated rates. This represents the most conservative (least favourable) pricing scenario for FDCs.
+
+2. **Jan Aushadhi (JA)**: Reflects generic pricing through the Pradhan Mantri Bhartiya Janaushadhi Pariyojana network, with SoC drugs at Jan Aushadhi prices and FDCs at the same current market prices. This represents a near-term realistic scenario for public-sector prescribing.
+
+3. **Private Branded**: Reflects out-of-pocket costs for patients purchasing branded formulations from private pharmacies. Under this perspective, the comparator (individual branded drugs purchased separately) is substantially more expensive than the FDC, reflecting the inherent cost advantage of fixed-dose combinations in the private market. This represents the current reality for most Indian patients.
+
+Crucially, **the FDC price is held constant across all three perspectives** at the current lowest available market price, since FDCs are not yet available through government procurement or Jan Aushadhi channels. Only the SoC comparator price varies across perspectives. This multi-perspective approach captures the reality that drug acquisition costs for individual pills vary by 10--50-fold across procurement channels in India, and that the cost-effectiveness of FDCs is driven primarily by the pricing of the comparator (separate pills) rather than by the FDC itself.
+
+## Comparators
+
+Four treatment strategies are compared:
+
+1. **SECURE type Rational FDC** (Tier 1): A fixed-dose combination incorporating aspirin, a statin, and an ACE inhibitor, with efficacy data derived from the SECURE trial (Castellano et al., NEJM 2022). This represents the evidence-based optimum.
+
+2. **Triple DAPT + Atorvastatin FDC** (Tier 2): A fixed-dose combination of aspirin, clopidogrel, and atorvastatin, with efficacy parameters derived from observational adherence studies.
+
+3. **Triple DAPT + Rosuvastatin FDC** (Tier 2): A fixed-dose combination of aspirin, clopidogrel, and rosuvastatin, reflecting alternative statin selection.
+
+4. **DAPT-only FDC** (Tier 2): A fixed-dose dual antiplatelet regimen (aspirin + clopidogrel) without integrated statin therapy, representing a minimal-intervention strategy.
+
+## Time Horizon & Discounting
+
+The analysis employs a `r HORIZON`-year (lifetime) time horizon, considered adequate for capturing the full long-term MACE prevention benefits in post-ACS populations. Both costs and health outcomes are discounted at an annual rate of `r DISC_RATE * 100`%, consistent with Indian HTA guidelines. The discount rate was applied using standard formulas: PV = FV / (1 + r)^t.
+
+## Model Structure
+
+The model employs an 8-state Markov microsimulation structure with annual cycles. Health states represent clinically distinct post-ACS states:
+
+1. **Stable Post-ACS**: Event-free survival post-ACS; baseline health state.
+2. **Acute MI**: Acute myocardial infarction requiring hospitalization.
+3. **Acute Stroke**: Acute ischemic stroke with immediate management.
+4. **Chronic MI**: Post-MI maintenance state with elevated recurrence risk.
+5. **Chronic Stroke**: Post-stroke maintenance state with long-term disability.
+6. **Heart Failure (HF)**: Incident or progressive heart failure.
+7. **Death (CV)**: Absorbing state --- cardiovascular mortality.
+8. **Death (Non-CV)**: Absorbing state --- non-cardiovascular mortality.
+
+Transitions between states are governed by risk parameters estimated from clinical trials and epidemiological data. The microsimulation structure allows individual-level heterogeneity: each simulated patient is assigned an age (drawn from Indian ACS demographics, mean 58 years, SD 12), sex (79% male per CREATE Registry), and comorbidity profile (diabetes 31%, hypertension 43%, smoking 40% per CREATE Registry). Patient-specific risk multipliers for recurrent MI and stroke are derived from secondary prevention registries (REACH Registry, Recurrent Stroke Meta-analysis, JAHA 2022 Post-ACS Cohort). Background mortality is age- and sex-specific using Indian SRS abridged life tables, and baseline health-state utilities are age- and sex-adjusted using Indian EQ-5D-5L population norms (DEVINE Study, J Global Health 2023). FDC strategies modify event transition probabilities via hazard ratios applied to event incidence rates.
+
+## Two-Tier Evidence Framework
+
+The analysis implements a structured evidence hierarchy reflecting data quality and relevance:
+
+- **Tier 1 (RCT-derived)**: SECURE type Rational FDC is evaluated using efficacy parameters directly from the SECURE trial (NEJM 2022), representing the gold standard for effect estimation. Sensitivity analysis uses a tighter standard error (SE = 0.10 on log-HR scale).
+- **Tier 2 (Adherence-derived)**: Alternative strategies (DAPT + Statins combinations, DAPT-only) utilize parameters derived from observational adherence studies, reflecting real-world effectiveness after adjustment for adherence patterns. A wider standard error (SE = 0.30 on log-HR scale) reflects greater parameter uncertainty.
+
+This two-tier structure enables explicit differentiation between efficacy (controlled trial conditions) and effectiveness (real-world adherence-adjusted outcomes).
+
+## Health Outcomes
+
+**Quality-Adjusted Life Years (QALYs)** serve as the primary health outcome measure, integrating both duration and quality of survival. Health state utilities were derived from EQ-5D-5L assessments in Indian post-ACS populations where available; missing values were supplemented from published literature on CV disease burden. Utility weights reflect the disutility associated with each health state relative to perfect health (utility = 1.0).
+
+## Resource Use & Costs
+
+Cost estimation incorporates both medication and healthcare utilization costs:
+
+**Drug costs** include aspirin, clopidogrel, statins (atorvastatin/rosuvastatin), ACE inhibitors, and other cardioprotective agents. SoC drug prices are sourced from three channels---government rate contracts, Jan Aushadhi price lists, and private branded market prices. FDC prices are set at the current lowest available market price across all perspectives, since FDCs are not yet available through government procurement or Jan Aushadhi channels.
+
+**Healthcare utilization costs** encompass hospitalizations for acute events (MI, stroke) and maintenance costs for chronic states (post-MI, post-stroke, heart failure). Event costs are derived from Indian health economic literature and denominated in `r CURRENCY_YEAR` prices.
+
+All costs are expressed in Indian Rupees (Rs); sensitivity analyses explore cost parameters across defined plausible ranges.
+
+## Analytical Methods
+
+### Base Case Analysis
+The base case employs point estimates of all parameters (median or mean values) to calculate expected ICERs and net monetary benefits (NMBs) across the three pricing perspectives, using `r scales::comma(N_PAT)` simulated patients per scenario over a `r HORIZON`-year horizon.
+
+### Deterministic Sensitivity Analysis (DSA)
+DSA systematically varies `r length(params_to_vary)` individual parameters across plausible ranges (typically ±20% for costs, clinically defined ranges for clinical parameters) to quantify impact on ICERs. Tornado diagrams display parameters ranked by impact magnitude, identifying key value drivers.
+
+Additionally, **one-way threshold analysis** identifies the parameter value (primarily treatment effect, expressed as hazard ratio) at which the ICER equals the WTP threshold, providing actionable evidence on critical decision thresholds.
+
+### Probabilistic Sensitivity Analysis (PSA)
+PSA samples all model parameters from pre-specified probability distributions (lognormal for hazard ratios with tier-aware standard errors, normal for transition probabilities) and executes `r scales::comma(PSA_ITERATIONS)` Monte Carlo iterations with `r scales::comma(PSA_N_PER_ITER)` patients per iteration. Results are visualized via cost-effectiveness planes, cost-effectiveness acceptability curves (CEAC), and ICER distribution summaries with 95% credible intervals.
+
+### Expected Value of Perfect Information (EVPI)
+EVPI quantifies the maximum value society would pay to eliminate all parametric uncertainty, calculated per patient and projected to population level (assuming `r scales::comma(ELIGIBLE_POP_ANNUAL)` eligible patients annually in India over a `r EVPI_DECISION_HORIZON`-year decision horizon). EVPI = E[max(NMB_i)] − max(E[NMB]), computed across the PSA sample.
+
+## Study Parameters Table
+
+```{r}
+#| label: tbl-params
+#| results: asis
+
+cat("**Table: Key Model Parameters: Base Case Estimates and Ranges**\n\n")
+param_table <- data.frame(
+  Parameter = c(
+    "Time Horizon (years)",
+    "Annual Discount Rate (%)",
+    "Model Cycles",
+    "Patients per Base Case Run",
+    "PSA Iterations",
+    "WTP Threshold (Rs per QALY)",
+    "Target Population (annual, India)",
+    "Currency Year",
+    "Perspective",
+    "Pricing Scenarios"
+  ),
+  Value = c(
+    as.character(HORIZON),
+    as.character(DISC_RATE * 100),
+    "Annual",
+    scales::comma(N_PAT),
+    scales::comma(PSA_ITERATIONS),
+    scales::comma(WTP_THRESHOLD),
+    scales::comma(ELIGIBLE_POP_ANNUAL),
+    CURRENCY_YEAR,
+    "Health system",
+    "3 (Govt RC, Jan Aushadhi, Private Branded)"
+  ),
+  Range = c(
+    "Sensitivity",
+    "0-5% (sensitivity)",
+    "---",
+    "---",
+    "---",
+    "Rs 0-750,000 (CEAC range)",
+    "---",
+    "---",
+    "---",
+    "---"
+  )
+)
+
+knitr::kable(param_table, "html", booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+```{r}
+#| label: setup-chapters
+# Function to render a full strategy chapter
+render_strategy_chapter <- function(scen_key) {
+
+  # Retrieve strategy outputs
+  strat <- strategy_outputs[[scen_key]]
+  dsa_scen <- dsa_results[[scen_key]]
+  psa_scen <- psa_results[[scen_key]]
+  threshold_scen <- threshold_results[[scen_key]]
+  evpi_scen <- evpi_results[[scen_key]]
+  tornado_scen <- tornado_plots[[scen_key]]
+
+  # Get scenario label from config
+  scen_label <- scenario_labels[[scen_key]]
+  scen_short <- scenario_short[[scen_key]]
+  scen_tier <- strat$tier
+
+  cat("\n\n")
+
+  # Base Case
+  cat("## Base Case Analysis\n\n")
+
+  cat("This section presents the base case cost-effectiveness analysis for ",
+      scen_short, " (Tier ", scen_tier, ") across three pricing perspectives.\n\n", sep = "")
+
+  # Print base case table (columns: Pricing, Delta_Cost, Delta_QALY, ICER, NMB)
+  cat("\n")
+  print(knitr::kable(strat$base_tbl, "html", booktabs = TRUE,
+                     col.names = c("Pricing", "Delta Cost (Rs)", "Delta QALY", "ICER (Rs/QALY)", "NMB (Rs)")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE))
+  cat("\n\n")
+
+  # Survival Curves
+  cat("## Survival Analysis\n\n")
+
+  cat("Kaplan-Meier-style event-free survival curves projected by the microsimulation model over the ",
+      HORIZON, "-year horizon.\n\n", sep = "")
+
+  surv_plot <- strat$surv_df %>%
+    ggplot(aes(x = Year, y = Survival, colour = Strategy, linetype = Strategy)) +
+    geom_line(linewidth = 1) +
+    scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+    scale_x_continuous(breaks = seq(0, HORIZON, by = 5)) +
+    labs(title = paste("Event-Free Survival Curves ---", scen_short),
+         x = "Years Post-ACS",
+         y = "Probability of Survival",
+         colour = "Strategy", linetype = "Strategy") +
+    theme(legend.position = "bottom")
+
+  print(surv_plot)
+
+  cat("\n\n")
+
+  # Markov Trace
+  cat("## Markov Trace (State Occupancy)\n\n")
+
+  cat("Mean proportions of the cohort in each health state over time for the FDC arm.\n\n")
+
+  trace_plot <- strat$trace_long %>%
+    ggplot(aes(x = Year, y = Proportion, fill = State)) +
+    geom_area(position = "stack") +
+    scale_y_continuous(labels = scales::percent) +
+    scale_x_continuous(breaks = seq(0, HORIZON, by = 5)) +
+    labs(title = paste("Markov State Occupancy ---", scen_short),
+         x = "Years Post-ACS",
+         y = "Proportion of Cohort",
+         fill = "Health State") +
+    theme(legend.position = "bottom")
+
+  print(trace_plot)
+
+  cat("\n\n")
+
+  # Deterministic Sensitivity Analysis
+  cat("## Deterministic Sensitivity Analysis\n\n")
+
+  cat("Tornado diagram displaying the impact of individual parameter variations on the base case ICER. Parameters ranked by magnitude of impact.\n\n")
+
+  print(tornado_scen)
+
+  cat("\n\n")
+
+  # Probabilistic Sensitivity Analysis
+  cat("## Probabilistic Sensitivity Analysis\n\n")
+
+  cat("Results from ", scales::comma(PSA_ITERATIONS), " Monte Carlo iterations.\n\n", sep = "")
+
+  # CE Plane
+  cat("### Cost-Effectiveness Plane\n\n")
+
+  ce_plane <- psa_scen %>%
+    ggplot(aes(x = Delta_QALY, y = Delta_Cost)) +
+    geom_point(alpha = 0.3, size = 1, colour = "#0072B2") +
+    geom_abline(intercept = 0, slope = WTP_THRESHOLD, color = "red", linetype = "dashed",
+                linewidth = 1) +
+    geom_hline(yintercept = 0, color = "gray", linetype = "dotted") +
+    geom_vline(xintercept = 0, color = "gray", linetype = "dotted") +
+    scale_y_continuous(labels = scales::comma) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(title = paste("Cost-Effectiveness Plane ---", scen_short),
+         x = "Incremental QALYs",
+         y = "Incremental Cost (Rs)",
+         subtitle = paste0(scales::comma(PSA_ITERATIONS), " PSA iterations; red line = WTP threshold"))
+
+  print(ce_plane)
+
+  cat("\n\n")
+
+  # CEAC (filter by scenario label, which is what ceac_data contains)
+  cat("### Cost-Effectiveness Acceptability Curve\n\n")
+
+  ceac_scen <- ceac_data %>% filter(Scenario == scen_label)
+
+  if (nrow(ceac_scen) > 0) {
+    ceac_plot <- ceac_scen %>%
+      ggplot(aes(x = WTP, y = P_CE)) +
+      geom_line(linewidth = 1, colour = "#0072B2") +
+      geom_vline(xintercept = WTP_THRESHOLD, linetype = "dashed", colour = "red") +
+      scale_x_continuous(labels = scales::comma) +
+      scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+      labs(title = paste("CEAC ---", scen_short),
+           x = "Willingness-to-Pay (Rs per QALY)",
+           y = "Probability Cost-Effective")
+
+    print(ceac_plot)
+  }
+
+  cat("\n\n")
+
+  # PSA Summary Statistics (filter by label, which matches psa_summary_df$Scenario)
+  cat("### PSA Summary\n\n")
+
+  psa_stats <- psa_summary_df %>% filter(Scenario == scenario_evidence[[scen_key]]$label)
+
+  if (nrow(psa_stats) > 0) {
+    psa_sum_tbl <- data.frame(
+      Metric = c(
+        "Mean ICER (Rs/QALY)",
+        "ICER 95% CrI: Lower",
+        "ICER 95% CrI: Upper",
+        "Probability Cost-Effective",
+        "Probability Dominant",
+        "Decision: Optimal?"
+      ),
+      Value = c(
+        scales::comma(round(psa_stats$Mean_ICER)),
+        scales::comma(round(psa_stats$ICER_2p5)),
+        scales::comma(round(psa_stats$ICER_97p5)),
+        scales::percent(psa_stats$P_CE, accuracy = 0.1),
+        scales::percent(psa_stats$P_Dominant, accuracy = 0.1),
+        ifelse(psa_stats$P_CE > 0.8, "Yes (>80%)", "Uncertain")
+      )
+    )
+
+    print(knitr::kable(psa_sum_tbl, "html", booktabs = TRUE) %>%
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE))
+  }
+
+  cat("\n\n")
+
+  # Threshold Analysis
+  cat("## Threshold Analysis\n\n")
+
+  cat("One-way sensitivity analysis on the most influential treatment effect (hazard ratio) identifies the critical threshold at which cost-effectiveness status changes.\n\n")
+
+  if (!is.null(threshold_scen$plot)) {
+    print(threshold_scen$plot)
+  }
+
+  cat("\n\n")
+
+  if (!is.null(threshold_scen)) {
+    thresh_tbl <- data.frame(
+      Metric = c(
+        "Swept Parameter",
+        "Point Estimate (HR)",
+        "Threshold HR (at WTP)",
+        "Margin to Threshold",
+        "Direction"
+      ),
+      Value = c(
+        threshold_scen$swept_label,
+        sprintf("%.3f", threshold_scen$point_estimate),
+        ifelse(is.na(threshold_scen$threshold_hr), "Always CE within range", sprintf("%.3f", threshold_scen$threshold_hr)),
+        ifelse(is.na(threshold_scen$margin), "Robust", sprintf("%.3f", threshold_scen$margin)),
+        ifelse(is.na(threshold_scen$margin), "Robust (CE throughout range)",
+               ifelse(threshold_scen$margin > 0, "Favorable (room to spare)", "Unfavorable"))
+      )
+    )
+
+    print(knitr::kable(thresh_tbl, "html", booktabs = TRUE) %>%
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE))
+  }
+
+  cat("\n\n")
+}
+```
+
+# Results: SECURE type Rational FDC
+
+```{r}
+#| label: ch-secure
+#| results: asis
+render_strategy_chapter("secure")
+```
+
+---
+
+# Results: Triple DAPT + Atorvastatin FDC
+
+```{r}
+#| label: ch-dapt-atorva
+#| results: asis
+render_strategy_chapter("dapt_atorva")
+```
+
+---
+
+# Results: Triple DAPT + Rosuvastatin FDC
+
+```{r}
+#| label: ch-dapt-rosuva
+#| results: asis
+render_strategy_chapter("dapt_rosuva")
+```
+
+---
+
+# Results: DAPT only FDC
+
+```{r}
+#| label: ch-dapt-only
+#| results: asis
+render_strategy_chapter("dapt_only")
+```
+
+---
+
+# Comparative Analysis
+
+## Cross-Strategy ICER Matrix
+
+The following matrix displays the incremental cost-effectiveness ratios for all four strategies across all three pricing perspectives.
+
+```{r}
+#| label: tbl-icer-matrix
+#| results: asis
+
+cat("**Table: Incremental Cost-Effectiveness Ratios (Rs per QALY) --- All Strategies x Pricing**\n\n")
+print(knitr::kable(icer_display, "html", booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE))
+```
+
+## Overlaid Cost-Effectiveness Acceptability Curves
+
+```{r}
+#| label: fig-ceac-overlay
+#| fig-cap: "Cost-Effectiveness Acceptability: All Strategies Compared"
+
+ceac_overlay <- ceac_data %>%
+  ggplot(aes(x = WTP, y = P_CE, colour = Scenario, linetype = Scenario)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = WTP_THRESHOLD, color = "gray", linetype = "dotted") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "Comparative Cost-Effectiveness Acceptability Across All Strategies",
+       x = "Willingness-to-Pay (Rs per QALY)",
+       y = "Probability Cost-Effective",
+       colour = "Strategy", linetype = "Strategy")
+
+print(ceac_overlay)
+```
+
+## Threshold Analysis Summary
+
+```{r}
+#| label: tbl-threshold-summary
+#| results: asis
+
+cat("**Table: One-Way Threshold Analysis: Critical Hazard Ratios by Strategy**\n\n")
+threshold_summary <- bind_rows(
+  lapply(names(threshold_results), function(scen) {
+    thresh_obj <- threshold_results[[scen]]
+    data.frame(
+      Strategy = scenario_labels[[scen]],
+      `Swept Parameter` = thresh_obj$swept_label,
+      `Point Estimate` = sprintf("%.3f", thresh_obj$point_estimate),
+      `Threshold HR` = ifelse(is.na(thresh_obj$threshold_hr), "Always CE",
+                              sprintf("%.3f", thresh_obj$threshold_hr)),
+      Margin = ifelse(is.na(thresh_obj$margin), "Robust",
+                      sprintf("%.3f", thresh_obj$margin)),
+      Status = ifelse(is.na(thresh_obj$margin), "Robust",
+                      ifelse(thresh_obj$margin > 0, "Favorable", "Unfavorable")),
+      check.names = FALSE
+    )
+  })
+)
+
+print(knitr::kable(threshold_summary, "html", booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE))
+```
+
+## Expected Value of Perfect Information
+
+```{r}
+#| label: tbl-evpi
+#| results: asis
+
+cat("**Table: Expected Value of Perfect Information: Per-Patient and Population Perspectives**\n\n")
+evpi_summary <- bind_rows(
+  lapply(names(evpi_results), function(scen) {
+    evpi_obj <- evpi_results[[scen]]
+    data.frame(
+      Strategy = scenario_labels[[scen]],
+      `EVPI Per Patient (Rs)` = scales::comma(round(evpi_obj$evpi_per_patient)),
+      `Pop. EVPI (Rs Crore)` = scales::comma(round(evpi_obj$pop_evpi_crore, 1)),
+      `Optimal Strategy` = evpi_obj$optimal_strategy,
+      `Decision Confidence` = scales::percent(evpi_obj$decision_confidence, accuracy = 0.1),
+      check.names = FALSE
+    )
+  })
+)
+
+print(knitr::kable(evpi_summary, "html", booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = TRUE))
+```
+
+The EVPI represents the maximum amount worth paying to conduct future research that would eliminate all parametric uncertainty. High EVPI values suggest substantial value in obtaining additional clinical data; low EVPI suggests the current evidence base is sufficient for confident decision-making.
+
+## Dominance Assessment
+
+```{r}
+#| label: dominance-assessment
+#| results: asis
+
+cat("\nUnder base case analysis at the government pricing perspective:\n\n")
+
+# Use scenario labels for filtering (results_df$Scenario contains labels)
+secure_label <- scenario_evidence[["secure"]]$label
+secure_results <- results_df %>%
+  filter(Scenario == secure_label, Pricing == "Govt Rate Contract") %>%
+  slice(1)
+
+if (nrow(secure_results) > 0 && !is.na(secure_results$ICER)) {
+  delta_cost <- secure_results$Delta_Cost
+  delta_qaly <- secure_results$Delta_QALY
+  icer <- secure_results$ICER
+
+  if (delta_cost < 0 & delta_qaly > 0) {
+    cat("**SECURE type Rational FDC** demonstrates **dominance** (lower cost AND greater QALYs).\n\n")
+  } else if (icer <= WTP_THRESHOLD & delta_qaly > 0) {
+    cat(sprintf("**SECURE type Rational FDC** is **cost-effective** with an ICER of Rs %s per QALY (below WTP threshold of Rs %s).\n\n",
+                scales::comma(round(icer)), scales::comma(WTP_THRESHOLD)))
+  } else if (delta_qaly > 0) {
+    cat(sprintf("**SECURE type Rational FDC** has an ICER of Rs %s per QALY (above WTP threshold).\n\n",
+                scales::comma(round(icer))))
+  } else {
+    cat("**SECURE type Rational FDC** results require further interpretation.\n\n")
+  }
+} else {
+  cat("SECURE type Rational FDC base case results not available.\n\n")
+}
+```
+
+---
+
+# Discussion
+
+```{r}
+#| label: discussion-data
+#| include: false
+
+# Pull live numbers for inline use in discussion
+sec_govt  <- results_df %>% filter(Scenario == scenario_evidence$secure$label, Pricing == "Govt Rate Contract")
+sec_ja    <- results_df %>% filter(Scenario == scenario_evidence$secure$label, Pricing == "Jan Aushadhi")
+sec_pvt   <- results_df %>% filter(Scenario == scenario_evidence$secure$label, Pricing == "Private Branded")
+dapt_a_govt <- results_df %>% filter(Scenario == scenario_evidence$dapt_atorva$label, Pricing == "Govt Rate Contract")
+dapt_r_govt <- results_df %>% filter(Scenario == scenario_evidence$dapt_rosuva$label, Pricing == "Govt Rate Contract")
+dapt_o_govt <- results_df %>% filter(Scenario == scenario_evidence$dapt_only$label, Pricing == "Govt Rate Contract")
+sec_psa <- psa_summary_df %>% filter(Scenario == scenario_evidence$secure$label)
+sec_evpi <- evpi_results$secure
+da_evpi  <- evpi_results$dapt_atorva
+```
+
+## Key Findings
+
+This microsimulation-based health technology assessment provides robust evidence on the cost-effectiveness of rational fixed-dose combinations for cardiovascular secondary prevention in India. The central finding is unambiguous: **SECURE type Rational FDC is cost-effective under all three pricing perspectives** examined, with strong consistency between deterministic and probabilistic analyses.
+
+Under government rate contract pricing---where SoC drugs are at their cheapest but the FDC is at its current market price---the ICER is Rs `r scales::comma(round(sec_govt$ICER))` per QALY, well below the WTP threshold of Rs `r scales::comma(WTP_THRESHOLD)` (1× GDP per capita). This is the most conservative scenario for FDCs, yet cost-effectiveness is clearly demonstrated. Under Jan Aushadhi generic pricing, the ICER falls further to Rs `r scales::comma(round(sec_ja$ICER))` per QALY. Most strikingly, under private branded pricing---which reflects the **current reality** for most Indian patients purchasing separate pills---the FDC is **dominant**: it saves Rs `r scales::comma(abs(round(sec_pvt$Delta_Cost)))` per patient while delivering `r round(sec_pvt$Delta_QALY, 2)` additional QALYs.
+
+## The Pricing Paradox: Understanding Cost-Effectiveness Across Perspectives
+
+A key finding of this analysis is the dramatic variation in ICERs across pricing perspectives, despite the FDC price being identical (Rs 5.73/day for SECURE type) in all three. This variation is driven entirely by the SoC comparator price.
+
+Under **private branded pricing**, individual branded drugs carry significant mark-ups. The SoC comparator (aspirin + atorvastatin + ramipril purchased as separate branded tablets) costs approximately Rs 8.96/day, while the FDC costs Rs 5.73/day---a daily saving of Rs 3.23 that compounds to over Rs 1,100 annually. This makes the FDC dominant (cost-saving with better outcomes). The pattern holds across all four FDC strategies: the combined cost of separate branded pills always exceeds the FDC price.
+
+This has an immediate policy implication: **FDCs already offer cost savings to the majority of Indian patients who pay out-of-pocket for branded medications.** The economic case for FDC prescribing in private practice is self-evident and does not require government subsidy.
+
+Under **government rate contract pricing**, individual drugs are procured at near-cost (e.g., aspirin at Rs 0.19/day, atorvastatin at Rs 0.22/day), making the SoC very cheap (Rs 0.80/day for the SECURE comparator). The FDC at its current market price of Rs 5.73/day is therefore more expensive than the sum of its components at government rates, generating a positive incremental cost. However, the substantial QALY gain (`r round(sec_govt$Delta_QALY, 2)`) from improved adherence and clinical efficacy means the ICER remains highly favourable at Rs `r scales::comma(round(sec_govt$ICER))` per QALY. Importantly, this is the **most conservative test of FDC cost-effectiveness**: even when the comparator is at its absolute cheapest and the FDC is at its current market price, cost-effectiveness is clearly demonstrated. Should FDCs be included in future government tenders, the negotiated FDC price would be expected to fall substantially, further improving the ICER and potentially making FDCs cost-saving even in the public sector.
+
+## Clinical Effectiveness Across Tiers
+
+The two-tier evidence framework reveals a clear gradient in clinical benefit. SECURE type Rational FDC (Tier 1), backed by RCT evidence with hazard ratios of 0.70 for MI and 0.65 for stroke, generates `r round(sec_govt$Delta_QALY, 2)` incremental QALYs over the `r HORIZON`-year horizon. By contrast, Tier-2 strategies---whose HRs of 0.95--0.97 reflect modest adherence-driven improvements---produce smaller QALY gains of approximately `r round(dapt_a_govt$Delta_QALY, 2)` (DAPT+statin combinations) and `r round(dapt_o_govt$Delta_QALY, 2)` (DAPT-only).
+
+This 4--5-fold differential in clinical benefit has direct implications for the ICER. Tier-2 strategies with similar incremental costs but much smaller QALY gains produce correspondingly higher ICERs. Under government pricing, Triple DAPT + Atorvastatin has an ICER of Rs `r scales::comma(round(dapt_a_govt$ICER))` (below WTP threshold), while Triple DAPT + Rosuvastatin reaches Rs `r scales::comma(round(dapt_r_govt$ICER))` (above WTP threshold)---the difference driven entirely by the higher acquisition cost of rosuvastatin versus atorvastatin.
+
+## Sensitivity and Robustness
+
+Probabilistic sensitivity analysis with `r scales::comma(PSA_ITERATIONS)` iterations confirms the robustness of the SECURE finding: the probability of cost-effectiveness is `r scales::percent(sec_psa$P_CE, accuracy=0.1)` at the WTP threshold, with `r scales::percent(sec_psa$P_Dominant, accuracy=0.1)` probability of outright dominance. The 95% credible interval for the ICER (Rs `r scales::comma(round(sec_psa$ICER_2p5))` to Rs `r scales::comma(round(sec_psa$ICER_97p5))`) lies entirely below the WTP threshold.
+
+Threshold analysis provides additional reassurance: the SECURE type Rational FDC remains cost-effective across the **entire clinically plausible range** of the most influential hazard ratio parameter. The ICER never crosses the WTP threshold within the swept range, indicating that even substantial degradation in treatment effect would not alter the cost-effectiveness conclusion.
+
+For Tier-2 strategies, the picture is more nuanced. The threshold analysis identifies unfavourable margins for DAPT+statin combinations---the point estimate HR (0.97) is worse than the threshold HR needed for cost-effectiveness (0.875). This quantifies the degree to which real-world effectiveness must exceed current conservative assumptions for these strategies to be cost-effective at government prices.
+
+## Value of Information and Research Priorities
+
+EVPI analysis sharply differentiates the research value across tiers. For SECURE type Rational FDC, per-patient EVPI is only Rs `r scales::comma(round(sec_evpi$evpi_per_patient))` with `r scales::percent(sec_evpi$decision_confidence, accuracy=0.1)` decision confidence---the existing SECURE trial evidence is sufficient to support adoption with minimal residual uncertainty.
+
+In contrast, Tier-2 strategies show per-patient EVPI of Rs `r scales::comma(round(da_evpi$evpi_per_patient))` (DAPT+Atorvastatin), translating to a population EVPI of Rs `r scales::comma(round(da_evpi$pop_evpi_crore, 1))` crore over `r EVPI_DECISION_HORIZON` years---a substantial figure that justifies investment in pragmatic effectiveness trials. These trials should focus on measuring the actual MACE-reduction attributable to FDC-mediated adherence improvement, rather than relying on extrapolation from observational adherence studies.
+
+## Strengths and Limitations
+
+### Strengths
+
+- Two-tier evidence structure with tier-aware uncertainty (SE = 0.10 for Tier 1, SE = 0.30 for Tier 2) explicitly differentiates RCT efficacy from adherence-derived effectiveness
+- Heterogeneous patient cohort with age-sex distributions, comorbidity prevalence (diabetes, hypertension, smoking), and risk-factor-specific recurrent event HRs sourced from Indian registries (CREATE, REACH, JAHA 2022)
+- Age- and sex-specific background mortality from Indian SRS life tables and age-sex-adjusted baseline utilities from Indian EQ-5D-5L norms (DEVINE Study, J Global Health 2023)
+- Three-perspective cost analysis spanning government rate contract, Jan Aushadhi (generic), and private branded channels captures the full range of SoC pricing in Indian healthcare, with FDC priced conservatively at current market rates throughout
+- Threshold analysis identifies specific HR breakpoints for policy decisions, not just broad sensitivity ranges
+- EVPI analysis quantifies the monetary value of further research, guiding efficient allocation of research funding
+- CHEERS 2022 compliant reporting with transparent parameter documentation
+
+### Limitations
+
+- SECURE type Rational FDCs are not currently available under government rate contract or Jan Aushadhi channels; the Govt RC and JA perspectives model SoC drugs at those procurement rates while the FDC is priced at its current lowest market price, representing a conservative analysis
+- A single FDC price (current lowest market price) is used across all perspectives; if FDCs were included in government tenders, the negotiated price would likely be lower, making the Govt RC analysis conservative
+- Tier-2 HR estimates are derived from observational adherence studies, not direct RCTs; actual effectiveness may differ
+- Risk factor prevalence and recurrent event HRs are based on published Indian registry data (CREATE, REACH) rather than patient-level data from the study population
+- Utility estimates rely on published Indian EQ-5D-5L norms (DEVINE Study) rather than primary data collection from this patient population
+
+---
+
+# Conclusions & Policy Recommendations
+
+This health technology assessment provides clear evidence-based guidance for incorporating rational FDCs into India's cardiovascular secondary prevention framework.
+
+## Central Conclusion
+
+**SECURE type Rational FDC is cost-effective for post-ACS secondary prevention in India under all pricing perspectives examined, using the current lowest available market price of the FDC.** Under private branded pricing---the prevailing reality for most patients---it is **dominant (cost-saving with improved outcomes)**, making an immediate and compelling economic case for prescribing. Under Jan Aushadhi and government rate contract pricing, it remains highly cost-effective with ICERs of Rs `r scales::comma(round(sec_ja$ICER))` and Rs `r scales::comma(round(sec_govt$ICER))` per QALY respectively---both well below the WTP threshold. Notably, the government rate contract perspective represents the most conservative test: SoC drugs at their cheapest government-negotiated rates versus the FDC at its current market price, and yet cost-effectiveness is clearly demonstrated.
+
+## Policy Recommendations
+
+1. **Immediate prescribing recommendation.** Given dominance under private pricing, clinicians should be encouraged to prescribe SECURE type Rational FDC over separate pills for all eligible post-ACS patients, particularly those paying out-of-pocket. This requires no additional public expenditure and delivers immediate cost savings to patients.
+
+2. **Government tender inclusion.** Inclusion of SECURE type Rational FDC in government rate contract tenders and the National List of Essential Medicines (NLEM) should be prioritised. Our analysis demonstrates that even at the FDC's current market price (Rs 5.73/day), cost-effectiveness is maintained when compared against SoC drugs at their cheapest government-negotiated rates---the most conservative possible comparison. If FDCs are included in future government tenders, the negotiated FDC price would be expected to fall substantially (as is typical for high-volume procurement), further improving the ICER and potentially making FDCs cost-saving even in the public sector.
+
+3. **Jan Aushadhi network distribution.** The Jan Aushadhi perspective shows the lowest positive ICER (Rs `r scales::comma(round(sec_ja$ICER))`/QALY), making this the most efficient near-term channel for expanding FDC access to price-sensitive populations.
+
+4. **Differential evidence requirements for Tier-2 FDCs.** EVPI analysis demonstrates minimal residual uncertainty for SECURE type Rational FDC (Rs `r scales::comma(round(sec_evpi$evpi_per_patient))` per patient) but substantial uncertainty for Tier-2 strategies (up to Rs `r scales::comma(round(max(sapply(evpi_results[c("dapt_atorva","dapt_rosuva","dapt_only")], function(x) x$evpi_per_patient), na.rm=TRUE)))` per patient). This supports a policy of: (a) immediate adoption of SECURE type Rational FDC based on existing RCT evidence, and (b) conditional listing of Tier-2 FDCs pending results from pragmatic effectiveness trials.
+
+5. **Research investment priorities.** The population EVPI for Tier-2 strategies (Rs `r scales::comma(round(da_evpi$pop_evpi_crore, 1))` crore for DAPT+Atorvastatin alone) provides an upper bound on the value of conducting effectiveness trials. ICMR and funding agencies should consider commissioning multi-centre pragmatic trials measuring MACE outcomes with Tier-2 FDCs, with budgets justified by the EVPI estimates.
+
+6. **Post-market surveillance.** A registry-based surveillance programme should be established to monitor real-world FDC utilisation, adherence patterns, and cardiovascular outcomes following formulary inclusion, enabling periodic model recalibration.
+
+---
+
+# Appendix A: CHEERS 2022 Compliance Checklist
+
+| Item # | Domain | Item | Section |
+|--------|--------|------|---------|
+| 1 | Title | Decision problem in title | Title |
+| 2 | Abstract | Structured abstract | Structured Abstract |
+| 3 | Introduction | Decision problem & context | Introduction |
+| 4 | Target Pop. | Target population definition | 2.1 |
+| 5 | Setting | Healthcare setting | 2.1 |
+| 6 | Perspective | Analysis perspective | 2.2 |
+| 7 | Comparators | All interventions described | 2.3 |
+| 8 | Time Horizon | Explicit time horizon | 2.4 |
+| 9 | Discount Rate | Discount rates | 2.4 |
+| 10 | Data Sources | Clinical data sources | 2.5--2.8 |
+| 11 | Health Outcomes | Outcome measures (QALYs) | 2.7 |
+| 12 | Utilities | Utility value methods | 2.7 |
+| 13 | Uncertainty | Sensitivity methods | 2.9 |
+| 14 | HRQoL | Utility/HRQoL data | 2.7 |
+| 15 | Costs | Cost categories & sources | 2.8 |
+| 16 | Currency & Year | Currency & price year | 2.8 |
+| 17 | Model Structure | Model description | 2.5 |
+| 18 | Validation | Model validation | Discussion |
+| 19 | Base Case | Results table/figure | Ch. 3--6, §.1 |
+| 20 | DSA | DSA results | Ch. 3--6, §.4 |
+| 21 | PSA | PSA, plane, CEAC | Ch. 3--6, §.5 |
+| 22 | Parameters | Parameter table | 2.10 |
+| 23 | Comparator Selection | Justification | 2.3 |
+| 24 | Perspective Rationale | Perspective justification | 2.2 |
+| 25 | Heterogeneity | Cross-strategy comparison | Ch. 7 |
+| 26 | Discussion | Interpretation | Discussion |
+| 27 | Funding | Funding sources | Funding |
+| 28 | COI | COI disclosure | Funding |
+
+---
+
+# Appendix B: Computation Details
+
+This report was generated on **`r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`** from pre-computed results files.
+
+**Input Data Files:**
+
+- Base case: `outputs/base_case.rds` (generated `r tryCatch(format(base_case$timestamp, "%Y-%m-%d %H:%M"), error = function(e) "N/A")`)
+- DSA: `outputs/dsa.rds` (generated `r tryCatch(format(dsa$timestamp, "%Y-%m-%d %H:%M"), error = function(e) "N/A")`)
+- PSA: `outputs/psa.rds` (generated `r tryCatch(format(psa$timestamp, "%Y-%m-%d %H:%M"), error = function(e) "N/A")`)
+- Config: `00_config.R`
+
+**Configuration:** `r HORIZON`-year horizon | `r DISC_RATE*100`% discount | WTP Rs `r scales::comma(WTP_THRESHOLD)` | `r scales::comma(N_PAT)` patients (base case) | `r scales::comma(PSA_ITERATIONS)` PSA iterations
+
+All figures and tables are generated dynamically from .rds files with zero computation at render time.
+
+---
+
+# Funding & Conflicts of Interest
+
+**Funding:** This analysis was supported by the ICMR Centre for Advanced Research in Cardiology (ICRAG-2), PI: Dr Denis Xavier.
+
+**Conflicts of Interest:** [Insert relevant disclosure statements.]

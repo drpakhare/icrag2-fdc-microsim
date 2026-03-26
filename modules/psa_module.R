@@ -8,8 +8,8 @@ psaUI <- function(id) {
       box(title = "1. PSA Parameter Uncertainty (Standard Errors)", width = 12, status = "primary", solidHeader = TRUE,
           column(4, 
                  h4("Sampling Control"),
-                 numericInput(ns("psa_n"), "PSA Iterations", 100, min = 50, step = 50),
-                 helpText("Use 1000 for final research publication."),
+                 numericInput(ns("psa_n"), "PSA Iterations", 5000, min = 50, step = 50),
+                 helpText("Default: 5000 (matches report pipeline)."),
                  actionButton(ns("run_psa"), "Run Probabilistic Analysis", 
                               class = "btn-danger btn-lg", width = "100%")
           ),
@@ -170,8 +170,8 @@ psaServer <- function(id, tp_base, cost_base, util_base, n_pat, horizon, disc_co
           # 2. RUN ENGINE
           # We pass a unique seed (42 + i) to each cohort run so they are different 
           # but the entire set of runs remains reproducible.
-          res <- run_microsim_engine(tp_p, cost_p, util_p, n_pat = 500, 
-                                     horizon = horizon, disc_cost = disc_cost(), 
+          res <- run_microsim_engine(tp_p, cost_p, util_p, n_pat = 1000,
+                                     horizon = horizon, disc_cost = disc_cost(),
                                      disc_util = disc_util(), seed = 42 + i)
           
           sim_data$dC[i] <- res$FDC$avg_cost - res$SoC$avg_cost

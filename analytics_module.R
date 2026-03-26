@@ -9,15 +9,33 @@ render_icer_box <- function(res, wtp) {
   dC <- res$FDC$avg_cost - res$SoC$avg_cost
   dE <- res$FDC$avg_qaly - res$SoC$avg_qaly
   icer <- dC / dE
-  
+
   if (dC < 0 & dE > 0) {
-    infoBox("Result: FDC DOMINATES", "More Effective & Less Expensive", 
+    # NE quadrant (from SoC perspective): FDC cheaper & more effective
+    infoBox("Result: FDC DOMINATES", "More Effective & Less Expensive",
             icon = icon("medal"), color = "green", fill = TRUE)
-  } else if (icer < wtp) {
-    infoBox("Result: COST-EFFECTIVE", paste("ICER (₹", round(icer,0), ") is below Threshold"), 
+  } else if (dC > 0 & dE < 0) {
+    # SW quadrant: FDC costlier & less effective — dominated
+    infoBox("Result: FDC IS DOMINATED",
+            paste0("Less Effective & More Expensive (ΔC = ₹", format(round(dC,0), big.mark=","),
+                   ", ΔE = ", round(dE,4), ")"),
+            icon = icon("ban"), color = "red", fill = TRUE)
+  } else if (dC < 0 & dE < 0) {
+    # SE quadrant: FDC cheaper but less effective — trade-off
+    infoBox("Result: TRADE-OFF",
+            paste0("FDC is Less Costly but Less Effective (ICER = ₹", format(round(icer,0), big.mark=","), ")"),
+            icon = icon("scale-balanced"), color = "yellow", fill = TRUE)
+  } else if (abs(dE) < 0.0001) {
+    # Negligible QALY difference
+    infoBox("Result: NEGLIGIBLE DIFFERENCE", "Incremental QALYs ≈ 0",
+            icon = icon("equals"), color = "yellow", fill = TRUE)
+  } else if (icer <= wtp) {
+    # NW quadrant: FDC costlier but more effective, below WTP
+    infoBox("Result: COST-EFFECTIVE", paste0("ICER (₹", format(round(icer,0), big.mark=","), ") is below Threshold"),
             icon = icon("check-circle"), color = "olive", fill = TRUE)
   } else {
-    infoBox("Result: NOT COST-EFFECTIVE", paste("ICER (₹", round(icer,0), ") exceeds WTP"), 
+    # NW quadrant: FDC costlier but more effective, above WTP
+    infoBox("Result: NOT COST-EFFECTIVE", paste0("ICER (₹", format(round(icer,0), big.mark=","), ") exceeds WTP"),
             icon = icon("circle-xmark"), color = "red", fill = TRUE)
   }
 }

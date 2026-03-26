@@ -284,10 +284,15 @@ costingServer <- function(id) {
         hr_user_override(FALSE)
       }
 
-      # Update FDC price
+      # Update FDC price (perspective-aware for actual formulary rates)
       fdc <- fdc_lookup[[cat]]
       if (!is.null(fdc)) {
-        updateNumericInput(session, "c_fdc_daily", value = fdc$price)
+        fdc_price <- fdc$price  # default
+        # DAPT+Atorva has actual Jan Aushadhi formulary price
+        if (cat == "dapt_atorva" && input$pricing_perspective == "ja") {
+          fdc_price <- 4.125
+        }
+        updateNumericInput(session, "c_fdc_daily", value = fdc_price)
       }
 
       # Update SoC drug composition
@@ -334,6 +339,16 @@ costingServer <- function(id) {
       if (input$c_amlod > 0) updateNumericInput(session, "c_amlod", value = prices$amlod)
       if (input$c_cilnidipine > 0) updateNumericInput(session, "c_cilnidipine", value = prices$cilni)
       if (input$c_hctz > 0) updateNumericInput(session, "c_hctz", value = prices$hctz)
+
+      # Perspective-specific FDC prices (actual formulary/RC rates only)
+      # DAPT+Atorva: actual Jan Aushadhi price = Rs 4.125 (in JA national formulary)
+      cat <- input$fdc_category
+      if (cat == "dapt_atorva" && input$pricing_perspective == "ja") {
+        updateNumericInput(session, "c_fdc_daily", value = 4.125)
+      } else if (cat != "custom") {
+        fdc <- fdc_lookup[[cat]]
+        if (!is.null(fdc)) updateNumericInput(session, "c_fdc_daily", value = fdc$price)
+      }
     })
 
     # ================================================================

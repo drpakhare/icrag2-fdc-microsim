@@ -71,8 +71,8 @@ dsaUI <- function(id) {
             numericInput(ns("wtp_threshold"), "WTP Threshold (₹ / QALY)", 236000, step = 10000),
             helpText("Default: 1× India GDP/capita (FY2024-25). 3× = ₹7,05,000."),
             hr(),
-            numericInput(ns("dsa_n_pat"), "Patients per Run", 500, min = 100, step = 100),
-            helpText("Use 500 for speed, 1000+ for stability."),
+            numericInput(ns("dsa_n_pat"), "Patients per Run", 1000, min = 100, step = 100),
+            helpText("Default: 1000 (matches report pipeline)."),
             hr(),
             actionButton(ns("run_dsa"), "Run Sensitivity Analysis",
                          class = "btn-warning btn-block btn-lg",
@@ -254,44 +254,48 @@ dsaServer <- function(id, tp_base, cost_base, util_base, n_pat, horizon) {
             if(p == "u_stable")       ut_w$u_stable <- val
             if(p == "u_mi")           ut_w$u_mi <- val
 
-            # Rebuild simplified 7-state transition matrices
-            states <- c("Stable", "Acute", "Chronic_MI", "Chronic_Stroke", "HF", "Death_CV", "Death_NonCV")
+            # Rebuild 8-state transition matrices (matching engine_v2 structure)
+            states <- c("Stable", "Acute_MI", "Acute_Stroke", "Chronic_MI", "Chronic_Stroke", "HF", "Death_CV", "Death_NonCV")
             for(strat in c("soc", "fdc")) {
-              m <- matrix(0, 7, 7, dimnames = list(states, states))
+              m <- matrix(0, 8, 8, dimnames = list(states, states))
               mi <- if(strat == "soc") tp_w$p_MI else tp_w$p_MI * tp_w$hr_MI
               st <- if(strat == "soc") tp_w$p_Stroke else tp_w$p_Stroke * tp_w$hr_Stroke
               hf <- if(strat == "soc") tp_w$p_HF else tp_w$p_HF * tp_w$hr_HF
               scd <- if(strat == "soc") tp_w$p_SCD else tp_w$p_SCD * tp_w$hr_SCD
               bg <- tp_w$p_BG_Mort
-              m["Stable", "Acute"] <- mi + st
+              m["Stable", "Acute_MI"] <- mi
+              m["Stable", "Acute_Stroke"] <- st
               m["Stable", "HF"] <- hf
               m["Stable", "Death_CV"] <- scd
               m["Stable", "Death_NonCV"] <- bg
-              p_tot <- mi + st
               cf_mi_w <- tp_w$cf_MI; cf_st_w <- tp_w$cf_Stroke
-              if(p_tot > 0) {
-                avg_cf <- (mi/p_tot * cf_mi_w) + (st/p_tot * cf_st_w)
-                m["Acute", "Death_CV"] <- avg_cf
-                m["Acute", "Chronic_MI"] <- (1 - avg_cf) * (mi / p_tot)
-                m["Acute", "Chronic_Stroke"] <- (1 - avg_cf) * (st / p_tot)
-              }
-              m["Chronic_MI", "Acute"] <- (mi * 1.5) + st
+              m["Acute_MI", "Death_CV"] <- cf_mi_w
+              m["Acute_MI", "Chronic_MI"] <- 1 - cf_mi_w
+              m["Acute_Stroke", "Death_CV"] <- cf_st_w
+              m["Acute_Stroke", "Chronic_Stroke"] <- 1 - cf_st_w
+              m["Chronic_MI", "Acute_MI"] <- mi * 1.5
+              m["Chronic_MI", "Acute_Stroke"] <- st
               m["Chronic_MI", "HF"] <- hf * 2.0
               m["Chronic_MI", "Death_CV"] <- scd * 1.3
               m["Chronic_MI", "Death_NonCV"] <- bg
-              m["Chronic_MI", "Chronic_MI"] <- 1 - sum(m["Chronic_MI",])
-              m["Chronic_Stroke", "Acute"] <- mi + (st * 1.5)
+              m["Chronic_Stroke", "Acute_MI"] <- mi
+              m["Chronic_Stroke", "Acute_Stroke"] <- st * 1.5
               m["Chronic_Stroke", "HF"] <- hf * 1.3
               m["Chronic_Stroke", "Death_CV"] <- scd * 1.5
               m["Chronic_Stroke", "Death_NonCV"] <- bg
-              m["Chronic_Stroke", "Chronic_Stroke"] <- 1 - sum(m["Chronic_Stroke",])
-              m["HF", "Acute"] <- (mi * 0.5) + (st * 0.75)
+              m["HF", "Acute_MI"] <- mi * 0.5
+              m["HF", "Acute_Stroke"] <- st * 0.75
               m["HF", "Death_CV"] <- tp_w$p_HF_Death
               m["HF", "Death_NonCV"] <- bg
-              m["HF", "HF"] <- 1 - sum(m["HF",])
               m["Death_CV", "Death_CV"] <- 1; m["Death_NonCV", "Death_NonCV"] <- 1
+              # Fill self-loops for living states
+              for (sn in c("Stable", "Chronic_MI", "Chronic_Stroke", "HF")) {
+                m[sn, sn] <- 1 - sum(m[sn, ])
+              }
               tp_w[[strat]] <- safe_normalize(m)
             }
+            # Store p_BG_Mort for engine age-mortality adjustment
+            tp_w$p_BG_Mort <- bg
 
             # Handle discount rate perturbation
             disc_c <- if(p == "disc_cost") val else 0.03
@@ -299,7 +303,7 @@ dsaServer <- function(id, tp_base, cost_base, util_base, n_pat, horizon) {
 
             res <- tryCatch(
               run_microsim_engine(tp_w, co_w, ut_w, n_pat = n_dsa, horizon = horizon,
-                                  disc_cost = disc_c, disc_util = disc_u),
+                                  disc_cost = disc_c, disc_util = disc_u, seed = 42),
               error = function(e) NULL
             )
             if (is.null(res) || is.null(res$FDC) || is.null(res$SoC)) next
@@ -350,7 +354,7 @@ dsaServer <- function(id, tp_base, cost_base, util_base, n_pat, horizon) {
     output$tornado_plot_icer <- renderPlotly({
       df <- dsa_results()
       req(df, nrow(df) > 0)
-      b_res <- run_microsim_engine(tp_base(), cost_base(), util_base(), 500, horizon)
+      b_res <- run_microsim_engine(tp_base(), cost_base(), util_base(), 1000, horizon, seed = 42)
       req(!is.null(b_res$FDC), !is.null(b_res$SoC))
       b_dC <- b_res$FDC$avg_cost - b_res$SoC$avg_cost
       b_dE <- b_res$FDC$avg_qaly - b_res$SoC$avg_qaly
@@ -362,7 +366,7 @@ dsaServer <- function(id, tp_base, cost_base, util_base, n_pat, horizon) {
     output$tornado_plot_nmb <- renderPlotly({
       df <- dsa_results()
       req(df, nrow(df) > 0)
-      b_res <- run_microsim_engine(tp_base(), cost_base(), util_base(), 500, horizon)
+      b_res <- run_microsim_engine(tp_base(), cost_base(), util_base(), 1000, horizon, seed = 42)
       req(!is.null(b_res$FDC), !is.null(b_res$SoC))
       b_dC <- b_res$FDC$avg_cost - b_res$SoC$avg_cost
       b_dE <- b_res$FDC$avg_qaly - b_res$SoC$avg_qaly

@@ -59,7 +59,7 @@ ui <- dashboardPage(
       tabItem(tabName = "tab_run",
               fluidRow(
                 box(title = "Simulation Control", width = 3, status = "primary", solidHeader = TRUE,
-                    numericInput("sim_n", "Cohort Size", 1000, min = 100),
+                    numericInput("sim_n", "Cohort Size", 10000, min = 100),
                     numericInput("sim_h", "Horizon (Years)", 30),
                     hr(),
                     numericInput("disc_cost", "Discount Rate: Costs (%)", 3.0),
@@ -125,8 +125,8 @@ server <- function(input, output, session) {
   d_u <- reactive({ input$disc_util / 100 })
   horizon_rx <- reactive({ input$sim_h })
 
-  dsaServer("mod_dsa", tp_rx, co_rx, ut_rx, n_pat = 500, horizon = input$sim_h)
-  psa_mod <- psaServer("mod_psa", tp_rx, co_rx, ut_rx, n_pat = 500, horizon = input$sim_h, disc_cost = d_c, disc_util = d_u)
+  dsaServer("mod_dsa", tp_rx, co_rx, ut_rx, n_pat = 1000, horizon = input$sim_h)
+  psa_mod <- psaServer("mod_psa", tp_rx, co_rx, ut_rx, n_pat = 1000, horizon = input$sim_h, disc_cost = d_c, disc_util = d_u)
   calib_mod <- calibrationServer("mod_calib", tp_rx, co_rx, ut_rx)
   methodologyServer("mod_meth")
 
@@ -185,7 +185,7 @@ server <- function(input, output, session) {
     # Generate patient cohort using profiles module
     cohort <- NULL
     if (input$use_heterogeneity) {
-      cohort <- profiles_mod$generate(input$sim_n, seed = 12345)
+      cohort <- profiles_mod$generate(input$sim_n, seed = 42)
     }
 
     run_microsim_engine_v2(
@@ -194,7 +194,7 @@ server <- function(input, output, session) {
       horizon = input$sim_h,
       disc_cost = d_c(),
       disc_util = d_u(),
-      seed = 12345,
+      seed = 42,
       patient_profiles = cohort,
       use_heterogeneity = input$use_heterogeneity,
       use_adherence_decay = input$use_adherence_decay,
@@ -257,6 +257,10 @@ server <- function(input, output, session) {
 
     icer_disp <- if(dC < 0 & dE > 0) {
       "FDC Dominates"
+    } else if(dC > 0 & dE < 0) {
+      "FDC Dominated"
+    } else if(dC < 0 & dE < 0) {
+      paste0("Trade-off (", round(dC/dE, 0), ")")
     } else if(is.null(dE) || abs(dE) < 0.0001) {
       "Insignificant dE"
     } else {

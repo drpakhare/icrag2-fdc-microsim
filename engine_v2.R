@@ -1,6 +1,7 @@
-# engine_v2.R — Upgraded microsimulation engine
+# engine_v2.R — Vectorized microsimulation engine
 # Features: heterogeneous patients, age-dependent mortality, adherence decay,
-#           recurrent event tracking, Indian EQ-5D norms, vectorized inner loop
+#           recurrent event tracking, Indian EQ-5D norms
+# Performance: Patient loop fully vectorized — all patients processed simultaneously per cycle
 
 # Indian SRS life table — background mortality by age-sex (annual probability)
 srs_life_table <- data.frame(
@@ -10,6 +11,16 @@ srs_life_table <- data.frame(
   female = c(0.0018, 0.0032, 0.0068, 0.0175, 0.0440, 0.1000)
 )
 
+# Vectorized background mortality lookup
+get_bg_mortality_vec <- function(ages, is_male) {
+  # Pre-build lookup: findInterval on age_lower boundaries
+  breaks <- c(srs_life_table$age_lower, Inf)
+  idx <- findInterval(ages, breaks, rightmost.closed = TRUE)
+  idx <- pmax(1, pmin(idx, nrow(srs_life_table)))
+  ifelse(is_male, srs_life_table$male[idx], srs_life_table$female[idx])
+}
+
+# Scalar version for backward compat
 get_bg_mortality <- function(age, is_male) {
   idx <- which(srs_life_table$age_lower <= age & srs_life_table$age_upper >= age)
   if (length(idx) == 0) idx <- nrow(srs_life_table)
@@ -24,6 +35,15 @@ eq5d_norms_v2 <- data.frame(
   female = c(0.922, 0.908, 0.858, 0.831, 0.766, 0.669, 0.488)
 )
 
+# Vectorized EQ-5D lookup
+get_eq5d_utility_vec <- function(ages, is_male) {
+  breaks <- c(eq5d_norms_v2$age_lower, Inf)
+  idx <- findInterval(ages, breaks, rightmost.closed = TRUE)
+  idx <- pmax(1, pmin(idx, nrow(eq5d_norms_v2)))
+  ifelse(is_male, eq5d_norms_v2$male[idx], eq5d_norms_v2$female[idx])
+}
+
+# Scalar version for backward compat
 get_eq5d_utility <- function(age, is_male) {
   idx <- which(eq5d_norms_v2$age_lower <= age & eq5d_norms_v2$age_upper >= age)
   if (length(idx) == 0) idx <- nrow(eq5d_norms_v2)
@@ -32,25 +52,21 @@ get_eq5d_utility <- function(age, is_male) {
 
 # Adherence decay (exponential, fitted from UMPIRE/FOCUS/TIPS-3)
 adherence_fdc <- function(t_years) {
-  t_months <- t_years * 12
-  0.877 * exp(-0.00692 * t_months)
+  0.877 * exp(-0.00692 * t_years * 12)
 }
-
 adherence_soc <- function(t_years) {
-  t_months <- t_years * 12
-  0.887 * exp(-0.02455 * t_months)
+  0.887 * exp(-0.02455 * t_years * 12)
 }
 
 # Effective HR adjusted for adherence decay
 effective_hr <- function(base_hr, t_years) {
   adh <- adherence_fdc(t_years)
-  adh_0 <- 0.877  # initial adherence
-  rel_retained <- adh / adh_0
+  rel_retained <- adh / 0.877
   1 - rel_retained * (1 - base_hr)
 }
 
 
-# === MAIN ENGINE V2 ===
+# === MAIN ENGINE V2 (VECTORIZED) ===
 run_microsim_engine_v2 <- function(tp_list, costs_list, utils_list, n_pat = 1000,
                                     horizon = 30, disc_cost = 0.03, disc_util = 0.03,
                                     seed = 123, patient_profiles = NULL,
@@ -64,11 +80,11 @@ run_microsim_engine_v2 <- function(tp_list, costs_list, utils_list, n_pat = 1000
 
   states <- colnames(tp_list$soc)
   n_states <- length(states)
+  state_idx <- setNames(seq_along(states), states)
   results <- list()
 
   # Generate patient cohort if not provided
   if (is.null(patient_profiles) || !use_heterogeneity) {
-    # Fallback: homogeneous cohort (backward compatible)
     patient_profiles <- data.frame(
       id = 1:n_pat,
       age = rep(58, n_pat),
@@ -82,273 +98,399 @@ run_microsim_engine_v2 <- function(tp_list, costs_list, utils_list, n_pat = 1000
     )
   }
 
-  # Ensure cohort size matches
   if (nrow(patient_profiles) != n_pat) {
     patient_profiles <- patient_profiles[sample(nrow(patient_profiles), n_pat, replace = TRUE), ]
     patient_profiles$id <- 1:n_pat
   }
 
-  # State utility lookup (disease multiplier relative to stable)
-  disease_util_multiplier <- function(state_name, utils) {
-    switch(state_name,
-           "Stable"         = utils$u_stable,
-           "Acute_MI"       = utils$u_acute_mi,
-           "Acute_Stroke"   = utils$u_acute_stroke,
-           "Chronic_MI"     = utils$u_mi,
-           "Chronic_Stroke" = utils$u_stroke,
-           "HF"             = utils$u_hf,
-           0)
+  # Pre-compute state utility and cost vectors (indexed by state_idx)
+  util_by_state <- vapply(states, function(s) {
+    switch(s, "Stable" = utils_list$u_stable, "Acute_MI" = utils_list$u_acute_mi,
+           "Acute_Stroke" = utils_list$u_acute_stroke, "Chronic_MI" = utils_list$u_mi,
+           "Chronic_Stroke" = utils_list$u_stroke, "HF" = utils_list$u_hf, 0)
+  }, numeric(1))
+
+  maint_by_state <- vapply(states, function(s) {
+    switch(s, "Stable" = costs_list$maint_stable, "Acute_MI" = costs_list$acute_mi,
+           "Acute_Stroke" = costs_list$acute_stroke, "Chronic_MI" = costs_list$maint_mi,
+           "Chronic_Stroke" = costs_list$maint_stroke, "HF" = costs_list$maint_hf, 0)
+  }, numeric(1))
+
+  # Identify column indices for MI and stroke states
+  mi_cols <- grep("MI", states)      # Acute_MI, Chronic_MI
+  stroke_cols <- grep("Stroke", states)
+  acute_mi_idx <- state_idx["Acute_MI"]
+  acute_stroke_idx <- state_idx["Acute_Stroke"]
+  death_cv_idx <- state_idx["Death_CV"]
+  death_noncv_idx <- state_idx["Death_NonCV"]
+  dead_indices <- c(death_cv_idx, death_noncv_idx)
+
+  # Non-death rows that need age-mortality adjustment
+  living_rows <- c("Stable", "Chronic_MI", "Chronic_Stroke", "HF")
+  living_row_idx <- state_idx[living_rows]
+  # Rows for heterogeneity adjustment
+  het_rows <- c("Stable", "Chronic_MI", "Chronic_Stroke")
+  het_row_idx <- state_idx[het_rows]
+
+  # Pre-compute Year 2+ matrix if time-varying MI
+  use_tv_mi <- !is.null(tp_list$use_time_varying_mi) && tp_list$use_time_varying_mi &&
+               !is.null(tp_list$p_MI_yr2)
+  tp_yr2_soc <- tp_list$soc
+  tp_yr2_fdc <- tp_list$fdc
+  if (use_tv_mi) {
+    mi_ratio <- tp_list$p_MI_yr2 / tp_list$p_MI
+    if (is.finite(mi_ratio) && mi_ratio < 1) {
+      for (mat_name in c("tp_yr2_soc", "tp_yr2_fdc")) {
+        mat <- get(mat_name)
+        for (rn in living_rows) {
+          if (rn %in% rownames(mat)) {
+            old_mi <- mat[rn, acute_mi_idx]
+            new_mi <- old_mi * mi_ratio
+            mat[rn, rn] <- mat[rn, rn] + (old_mi - new_mi)
+            mat[rn, acute_mi_idx] <- new_mi
+          }
+        }
+        assign(mat_name, mat)
+      }
+    }
   }
 
-  # Cost lookup per state
-  state_cost <- function(state_name, costs, is_fdc) {
-    maint <- switch(state_name,
-                    "Stable"         = costs$maint_stable,
-                    "Acute_MI"       = costs$acute_mi,
-                    "Acute_Stroke"   = costs$acute_stroke,
-                    "Chronic_MI"     = costs$maint_mi,
-                    "Chronic_Stroke" = costs$maint_stroke,
-                    "HF"             = costs$maint_hf,
-                    0)
-    drug <- if (is_fdc) costs$fdc_annual else costs$soc_annual
-    maint + drug
+  # Extract patient vectors for speed
+  pat_ages <- patient_profiles$age
+  pat_male <- patient_profiles$is_male
+  pat_rr_mi <- patient_profiles$rr_mi
+  pat_rr_stroke <- patient_profiles$rr_stroke
+
+  # Pre-compute per-patient bg mortality for each year (matrix n_pat x (horizon+1))
+  if (use_age_mortality) {
+    bg_mort_mat <- matrix(0, nrow = n_pat, ncol = horizon + 1)
+    for (t in 0:horizon) {
+      bg_mort_mat[, t + 1] <- get_bg_mortality_vec(pat_ages + t, pat_male)
+    }
+    old_bg <- if (!is.null(tp_list$p_BG_Mort)) tp_list$p_BG_Mort else 0.01
+  }
+
+  # Pre-compute per-patient EQ-5D norms for each year
+  if (use_age_utilities) {
+    eq5d_mat <- matrix(0, nrow = n_pat, ncol = horizon + 1)
+    eq5d_mat_next <- matrix(0, nrow = n_pat, ncol = horizon + 1)
+    for (t in 0:horizon) {
+      eq5d_mat[, t + 1] <- get_eq5d_utility_vec(pat_ages + t, pat_male)
+      eq5d_mat_next[, t + 1] <- get_eq5d_utility_vec(pat_ages + t + 1, pat_male)
+    }
+    u_stable_inv <- 1 / max(utils_list$u_stable, 0.01)
+  }
+
+  # Pre-compute discount factors
+  disc_cost_factors <- 1 / (1 + disc_cost)^(0:horizon)
+  disc_util_factors <- 1 / (1 + disc_util)^(0:horizon)
+
+  # Pre-compute adherence factors per year (for FDC blending)
+  if (use_adherence_decay) {
+    adh_factors <- adherence_fdc(0:horizon) / 0.877
   }
 
   for (strat in c("SoC", "FDC")) {
     is_fdc <- (strat == "FDC")
-    tp_matrix_base <- if (strat == "SoC") tp_list$soc else tp_list$fdc
+    tp_base <- if (is_fdc) tp_list$fdc else tp_list$soc
+    tp_base_yr2 <- if (is_fdc) tp_yr2_fdc else tp_yr2_soc
+    tp_soc <- tp_list$soc  # for adherence blending
 
-    total_costs <- 0
-    total_qalys <- 0
+    drug_annual <- if (is_fdc) costs_list$fdc_annual else costs_list$soc_annual
+
+    # State vector: integer index into states (1-based)
+    cur_state <- rep(state_idx["Stable"], n_pat)
+    alive <- rep(TRUE, n_pat)
+
+    # Accumulators
+    pat_costs <- numeric(n_pat)
+    pat_qalys <- numeric(n_pat)
+    n_mi_events <- integer(n_pat)
+    n_stroke_events <- integer(n_pat)
+
     trace <- matrix(0, nrow = horizon + 1, ncol = n_states)
     colnames(trace) <- states
 
-    # Event counter for recurrent events
-    event_counts <- matrix(0, nrow = n_pat, ncol = 2)  # col 1: MI count, col 2: Stroke count
-    colnames(event_counts) <- c("n_mi", "n_stroke")
+    # Pre-draw all random numbers at once (n_pat x horizon)
+    rand_mat <- matrix(runif(n_pat * (horizon + 1)), nrow = n_pat, ncol = horizon + 1)
 
-    # Pre-compute Year 2+ matrix if time-varying MI is enabled
-    use_tv_mi <- !is.null(tp_list$use_time_varying_mi) && tp_list$use_time_varying_mi &&
-                 !is.null(tp_list$p_MI_yr2)
-    tp_matrix_yr2 <- NULL
-    if (use_tv_mi) {
-      # Rebuild matrix with Year 2+ MI rate (lower rate)
-      p_mi_yr2 <- tp_list$p_MI_yr2
-      p_mi_yr1 <- tp_list$p_MI
-      if (p_mi_yr1 > 0 && p_mi_yr2 < p_mi_yr1) {
-        mi_ratio <- p_mi_yr2 / p_mi_yr1
-        tp_matrix_yr2 <- tp_matrix_base
-        # Scale MI transitions in rows that reference MI
-        for (rn in c("Stable", "Chronic_MI", "Chronic_Stroke", "HF")) {
-          if (rn %in% rownames(tp_matrix_yr2)) {
-            mi_col <- which(colnames(tp_matrix_yr2) == "Acute_MI")
-            if (length(mi_col) > 0) {
-              old_mi <- tp_matrix_yr2[rn, mi_col]
-              new_mi <- old_mi * mi_ratio
-              delta <- old_mi - new_mi
-              tp_matrix_yr2[rn, mi_col] <- new_mi
-              # Add delta back to self-loop
-              tp_matrix_yr2[rn, rn] <- tp_matrix_yr2[rn, rn] + delta
-            }
-          }
-        }
+    for (t in 0:horizon) {
+      # Record trace
+      for (s in 1:n_states) {
+        trace[t + 1, s] <- sum(cur_state == s)
       }
-    }
 
-    for (i in 1:n_pat) {
-      pat <- patient_profiles[i, ]
-      state <- "Stable"
-      pat_age <- pat$age
-      n_mi <- 0
-      n_stroke <- 0
-
-      for (t in 0:horizon) {
-        # Record state in trace
-        trace[t + 1, state] <- trace[t + 1, state] + 1
-
-        # If dead, carry forward and exit
-        if (state %in% c("Death_CV", "Death_NonCV")) {
-          if (t < horizon) {
-            for (f_t in (t + 1):horizon) {
-              trace[f_t + 1, state] <- trace[f_t + 1, state] + 1
-            }
+      # Skip if no one alive
+      n_alive <- sum(alive)
+      if (n_alive == 0) {
+        # Fill remaining trace with current distribution
+        if (t < horizon) {
+          for (ft in (t + 1):horizon) {
+            trace[ft + 1, ] <- trace[t + 1, ]
           }
-          break
         }
+        break
+      }
 
-        current_age <- pat_age + t
+      # Get alive patient indices
+      alive_idx <- which(alive)
 
-        # --- Build per-patient, time-dependent transition matrix ---
-        # Use Year 2+ matrix after first cycle if time-varying MI enabled
-        if (use_tv_mi && t >= 1 && !is.null(tp_matrix_yr2)) {
-          tp_matrix <- tp_matrix_yr2
+      # Select base transition matrix for this cycle
+      if (use_tv_mi && t >= 1) {
+        tp_cycle <- tp_base_yr2
+      } else {
+        tp_cycle <- tp_base
+      }
+
+      # Adherence decay: blend FDC matrix toward SoC at matrix level
+      # (BEFORE per-patient adjustments so heterogeneity/age-mortality apply uniformly)
+      if (is_fdc && use_adherence_decay && t > 0) {
+        af <- adh_factors[t + 1]
+        tp_soc_cycle <- if (use_tv_mi && t >= 1) tp_yr2_soc else tp_soc
+        tp_cycle <- af * tp_cycle + (1 - af) * tp_soc_cycle
+      }
+
+      # Build per-patient transition probability matrix (only for alive patients)
+      # Each alive patient gets a row of transition probs from their current state
+      n_a <- length(alive_idx)
+      probs_mat <- matrix(0, nrow = n_a, ncol = n_states)
+
+      # Group alive patients by their current state for efficiency
+      states_alive <- cur_state[alive_idx]
+      unique_states <- unique(states_alive)
+
+      for (s in unique_states) {
+        # Skip dead states
+        if (s %in% dead_indices) next
+
+        s_mask <- which(states_alive == s)  # indices within alive_idx
+        s_patients <- alive_idx[s_mask]     # global patient indices
+        ns <- length(s_patients)
+
+        # Start with base transition row for this state
+        base_row <- tp_cycle[s, ]
+
+        # 1. Age-dependent background mortality (per-patient)
+        if (use_age_mortality && states[s] %in% living_rows) {
+          bg_new <- bg_mort_mat[s_patients, t + 1]
+          # Each patient may have different bg mortality
+          # Adjust Death_NonCV and self-loop
+          delta <- bg_new - base_row[death_noncv_idx]
+          # Build per-patient rows
+          p_rows <- matrix(rep(base_row, ns), nrow = ns, byrow = TRUE)
+          p_rows[, death_noncv_idx] <- bg_new
+          p_rows[, s] <- p_rows[, s] - delta
+          p_rows[, s] <- pmax(0, p_rows[, s])
+          # Normalize rows
+          rsums <- rowSums(p_rows)
+          p_rows <- p_rows / rsums
         } else {
-          tp_matrix <- tp_matrix_base
-        }
-
-        # 1. Age-dependent background mortality
-        if (use_age_mortality) {
-          bg_mort <- get_bg_mortality(current_age, pat$is_male)
-          old_bg <- tp_list$p_BG_Mort
-          if (!is.null(old_bg) && old_bg > 0) {
-            bg_ratio <- bg_mort / old_bg
-          } else {
-            bg_ratio <- 1
-          }
-          # Adjust rows that have NonCV death
-          for (row_name in c("Stable", "Chronic_MI", "Chronic_Stroke", "HF")) {
-            if (row_name %in% rownames(tp_matrix)) {
-              old_val <- tp_matrix[row_name, "Death_NonCV"]
-              new_val <- bg_mort
-              delta <- new_val - old_val
-              tp_matrix[row_name, "Death_NonCV"] <- new_val
-              # Adjust self-loop to keep row summing to 1
-              tp_matrix[row_name, row_name] <- tp_matrix[row_name, row_name] - delta
-              # Clamp to valid probability
-              tp_matrix[row_name, row_name] <- max(0, tp_matrix[row_name, row_name])
-              # Re-normalize
-              row_sum <- sum(tp_matrix[row_name, ])
-              if (row_sum > 0) tp_matrix[row_name, ] <- tp_matrix[row_name, ] / row_sum
-            }
-          }
+          p_rows <- matrix(rep(base_row, ns), nrow = ns, byrow = TRUE)
         }
 
         # 2. Patient-specific risk multipliers (heterogeneity)
-        if (use_heterogeneity && (pat$rr_mi != 1 || pat$rr_stroke != 1)) {
-          # Scale MI and stroke transitions by patient-level HRs for recurrent events
-          # Sources: REACH Registry, Recurrent Stroke Meta-analysis (PMID 34153594)
-          # These are secondary prevention HRs (NOT primary prevention INTERHEART ORs)
-          mi_cols <- grep("MI", colnames(tp_matrix))
-          stroke_cols <- grep("Stroke", colnames(tp_matrix))
-
-          for (row_name in c("Stable", "Chronic_MI", "Chronic_Stroke")) {
-            if (row_name %in% rownames(tp_matrix)) {
-              for (mc in mi_cols) {
-                tp_matrix[row_name, mc] <- tp_matrix[row_name, mc] * pat$rr_mi
-              }
-              for (sc in stroke_cols) {
-                tp_matrix[row_name, sc] <- tp_matrix[row_name, sc] * pat$rr_stroke
-              }
-              # Clamp and re-normalize
-              tp_matrix[row_name, ] <- pmax(0, tp_matrix[row_name, ])
-              diag_idx <- which(rownames(tp_matrix) == row_name)
-              tp_matrix[row_name, diag_idx] <- 0
-              total_exit <- sum(tp_matrix[row_name, ])
-              if (total_exit >= 1) {
-                tp_matrix[row_name, ] <- tp_matrix[row_name, ] * (0.99 / total_exit)
-                tp_matrix[row_name, diag_idx] <- 0.01
-              } else {
-                tp_matrix[row_name, diag_idx] <- 1 - total_exit
-              }
+        if (use_heterogeneity && states[s] %in% het_rows) {
+          rr_mi_s <- pat_rr_mi[s_patients]
+          rr_str_s <- pat_rr_stroke[s_patients]
+          needs_adj <- (rr_mi_s != 1) | (rr_str_s != 1)
+          if (any(needs_adj)) {
+            adj_idx <- which(needs_adj)
+            for (mc in mi_cols) {
+              p_rows[adj_idx, mc] <- p_rows[adj_idx, mc] * rr_mi_s[adj_idx]
+            }
+            for (sc in stroke_cols) {
+              p_rows[adj_idx, sc] <- p_rows[adj_idx, sc] * rr_str_s[adj_idx]
+            }
+            # Re-normalize adjusted rows
+            p_rows[adj_idx, ] <- pmax(p_rows[adj_idx, , drop = FALSE], 0)
+            diag_col <- s
+            p_rows[adj_idx, diag_col] <- 0
+            exit_sums <- rowSums(p_rows[adj_idx, , drop = FALSE])
+            too_high <- exit_sums >= 1
+            if (any(too_high)) {
+              th_idx <- adj_idx[too_high]
+              p_rows[th_idx, ] <- p_rows[th_idx, , drop = FALSE] * (0.99 / exit_sums[too_high])
+              p_rows[th_idx, diag_col] <- 0.01
+            }
+            ok_idx <- adj_idx[!too_high]
+            if (length(ok_idx) > 0) {
+              p_rows[ok_idx, diag_col] <- 1 - rowSums(p_rows[ok_idx, -diag_col, drop = FALSE])
             }
           }
         }
 
-        # 3. Adherence decay (FDC only): attenuate HRs over time
-        if (is_fdc && use_adherence_decay && t > 0) {
-          # The FDC matrix was built with initial HRs. Adjust toward SoC as adherence drops.
-          adh_factor <- adherence_fdc(t) / 0.877  # fraction of initial adherence retained
-          # Blend: effective_matrix = adh_factor * fdc_matrix + (1 - adh_factor) * soc_matrix
-          for (row_name in rownames(tp_matrix)) {
-            if (row_name %in% c("Death_CV", "Death_NonCV")) next
-            tp_matrix[row_name, ] <- adh_factor * tp_matrix[row_name, ] +
-                                      (1 - adh_factor) * tp_list$soc[row_name, ]
+        # 3. Adherence decay — now applied at matrix level before this loop
+        #    (see tp_cycle blending above)
+
+        # 4. Recurrent event escalation for Chronic_MI patients
+        if (states[s] == "Chronic_MI") {
+          mi_counts <- n_mi_events[s_patients]
+          has_prev <- mi_counts > 0
+          if (any(has_prev)) {
+            esc_factors <- pmin(1 + 0.2 * mi_counts[has_prev], 2.0)
+            hp_idx <- which(has_prev)
+            for (mc in mi_cols) {
+              p_rows[hp_idx, mc] <- p_rows[hp_idx, mc] * esc_factors
+            }
+            p_rows[hp_idx, ] <- pmax(p_rows[hp_idx, , drop = FALSE], 0)
+            p_rows[hp_idx, s] <- 0
+            exit_s <- rowSums(p_rows[hp_idx, , drop = FALSE])
+            too_h <- exit_s >= 1
+            if (any(too_h)) {
+              th2 <- hp_idx[too_h]
+              p_rows[th2, ] <- p_rows[th2, , drop = FALSE] * (0.99 / exit_s[too_h])
+              p_rows[th2, s] <- 0.01
+            }
+            ok2 <- hp_idx[!too_h]
+            if (length(ok2) > 0) {
+              p_rows[ok2, s] <- 1 - rowSums(p_rows[ok2, -s, drop = FALSE])
+            }
           }
         }
 
-        # 4. Recurrent event escalation
-        if (n_mi > 0 && state == "Chronic_MI") {
-          esc <- min(1 + 0.2 * n_mi, 2.0)  # escalation caps at 2x
-          for (mc in grep("MI", colnames(tp_matrix))) {
-            tp_matrix["Chronic_MI", mc] <- tp_matrix["Chronic_MI", mc] * esc
-          }
-          # Re-normalize
-          tp_matrix["Chronic_MI", ] <- pmax(0, tp_matrix["Chronic_MI", ])
-          diag_idx <- which(rownames(tp_matrix) == "Chronic_MI")
-          tp_matrix["Chronic_MI", diag_idx] <- 0
-          tot <- sum(tp_matrix["Chronic_MI", ])
-          if (tot >= 1) {
-            tp_matrix["Chronic_MI", ] <- tp_matrix["Chronic_MI", ] * (0.99 / tot)
-            tp_matrix["Chronic_MI", diag_idx] <- 0.01
-          } else {
-            tp_matrix["Chronic_MI", diag_idx] <- 1 - tot
-          }
-        }
+        # Final normalize (safety)
+        p_rows <- pmax(p_rows, 0)
+        rsums <- rowSums(p_rows)
+        p_rows <- p_rows / rsums
 
-        # --- State rewards ---
-        cost_current <- state_cost(state, costs_list, is_fdc)
-
-        # Utility: use Indian EQ-5D norm adjusted by disease state
-        if (use_age_utilities) {
-          age_norm <- get_eq5d_utility(current_age, pat$is_male)
-          # Disease state utility as proportion of stable baseline
-          disease_u <- disease_util_multiplier(state, utils_list)
-          u_current <- age_norm * (disease_u / max(utils_list$u_stable, 0.01))
-        } else {
-          u_current <- disease_util_multiplier(state, utils_list)
-          if (utils_list$use_decay) u_current <- u_current * (1 - utils_list$decay_rate)^t
-        }
-
-        # --- Transition ---
-        probs <- pmax(0, tp_matrix[state, ])
-        probs <- probs / sum(probs)
-        next_state <- sample(states, size = 1, prob = probs)
-
-        # Track events
-        if (next_state == "Acute_MI") n_mi <- n_mi + 1
-        if (next_state == "Acute_Stroke") n_stroke <- n_stroke + 1
-
-        # --- Half-cycle correction rewards ---
-        cost_next <- state_cost(next_state, costs_list, is_fdc)
-        if (use_age_utilities) {
-          next_age_norm <- get_eq5d_utility(current_age + 1, pat$is_male)
-          next_disease_u <- disease_util_multiplier(next_state, utils_list)
-          u_next <- next_age_norm * (next_disease_u / max(utils_list$u_stable, 0.01))
-        } else {
-          u_next <- disease_util_multiplier(next_state, utils_list)
-          if (utils_list$use_decay) u_next <- u_next * (1 - utils_list$decay_rate)^t
-        }
-
-        cycle_cost <- (cost_current + cost_next) / 2
-        cycle_util <- (u_current + u_next) / 2
-
-        total_costs <- total_costs + (cycle_cost / (1 + disc_cost)^t)
-        total_qalys <- total_qalys + (cycle_util / (1 + disc_util)^t)
-
-        state <- next_state
+        probs_mat[s_mask, ] <- p_rows
       }
 
-      event_counts[i, "n_mi"] <- n_mi
-      event_counts[i, "n_stroke"] <- n_stroke
+      # Handle already-dead patients in alive set (shouldn't happen, but safety)
+      for (s in intersect(unique_states, dead_indices)) {
+        s_mask <- which(states_alive == s)
+        probs_mat[s_mask, s] <- 1  # stay dead
+      }
+
+      # --- State rewards for current state (vectorized) ---
+      cur_util_state <- util_by_state[cur_state[alive_idx]]
+      cur_cost_state <- maint_by_state[cur_state[alive_idx]] + drug_annual
+
+      if (use_age_utilities) {
+        age_norm <- eq5d_mat[alive_idx, t + 1]
+        u_current <- age_norm * cur_util_state * u_stable_inv
+      } else {
+        u_current <- cur_util_state
+        if (utils_list$use_decay) u_current <- u_current * (1 - utils_list$decay_rate)^t
+      }
+
+      # --- Transition: vectorized sampling ---
+      # Cumulative probabilities for each patient
+      cum_probs <- t(apply(probs_mat, 1, cumsum))
+      rands <- rand_mat[alive_idx, t + 1]
+      # Find next state: first column where cumsum >= rand
+      next_state_local <- apply(cum_probs >= rands, 1, function(x) which(x)[1])
+      next_state_local[is.na(next_state_local)] <- death_noncv_idx
+
+      # Track events
+      new_mi <- next_state_local == acute_mi_idx
+      new_stroke <- next_state_local == acute_stroke_idx
+      n_mi_events[alive_idx[new_mi]] <- n_mi_events[alive_idx[new_mi]] + 1L
+      n_stroke_events[alive_idx[new_stroke]] <- n_stroke_events[alive_idx[new_stroke]] + 1L
+
+      # --- Half-cycle correction rewards for next state ---
+      next_util_state <- util_by_state[next_state_local]
+      next_cost_state <- maint_by_state[next_state_local] + drug_annual
+
+      if (use_age_utilities) {
+        next_age_norm <- eq5d_mat_next[alive_idx, t + 1]
+        u_next <- next_age_norm * next_util_state * u_stable_inv
+      } else {
+        u_next <- next_util_state
+        if (utils_list$use_decay) u_next <- u_next * (1 - utils_list$decay_rate)^t
+      }
+
+      cycle_cost <- (cur_cost_state + next_cost_state) / 2
+      cycle_util <- (u_current + u_next) / 2
+
+      pat_costs[alive_idx] <- pat_costs[alive_idx] + cycle_cost * disc_cost_factors[t + 1]
+      pat_qalys[alive_idx] <- pat_qalys[alive_idx] + cycle_util * disc_util_factors[t + 1]
+
+      # Update states
+      cur_state[alive_idx] <- next_state_local
+
+      # Update alive status
+      alive[alive_idx] <- !(next_state_local %in% dead_indices)
     }
 
     trace_norm <- trace / n_pat
-    alive_cols <- !colnames(trace_norm) %in% c("Death_CV", "Death_NonCV")
+    alive_cols <- !states %in% c("Death_CV", "Death_NonCV")
+
+    event_counts <- cbind(n_mi = n_mi_events, n_stroke = n_stroke_events)
 
     results[[strat]] <- list(
-      avg_cost = total_costs / n_pat,
-      avg_qaly = total_qalys / n_pat,
+      avg_cost = mean(pat_costs),
+      avg_qaly = mean(pat_qalys),
       trace = trace_norm,
       survival = rowSums(trace_norm[, alive_cols]),
       event_counts = event_counts,
-      mean_mi_events = mean(event_counts[, "n_mi"]),
-      mean_stroke_events = mean(event_counts[, "n_stroke"])
+      mean_mi_events = mean(n_mi_events),
+      mean_stroke_events = mean(n_stroke_events)
     )
   }
 
   return(results)
 }
 
+# === DEFAULT PATIENT PROFILE GENERATOR ===
+# Matches Shiny app defaults (CREATE Registry demographics, REACH/recurrent HRs)
+generate_default_profiles <- function(n, seed = 123) {
+  set.seed(seed)
+  mean_age <- 58; sd_age <- 12; min_age <- 30; max_age <- 85
+  pct_male <- 79
+  prev_dm <- 0.31; prev_htn <- 0.43; prev_smoke <- 0.40
+  rr_dm_mi <- 1.44;  rr_htn_mi <- 1.21;  rr_smoke_mi <- 1.63
+  rr_dm_stroke <- 1.85; rr_htn_stroke <- 1.27; rr_smoke_stroke <- 1.52
+
+  eq5d_norms <- data.frame(
+    age_lower = c(0, 20, 30, 40, 50, 60, 70),
+    age_upper = c(19, 29, 39, 49, 59, 69, 99),
+    male   = c(0.936, 0.920, 0.882, 0.833, 0.814, 0.780, 0.643),
+    female = c(0.922, 0.908, 0.858, 0.831, 0.766, 0.669, 0.488)
+  )
+  get_eq5d <- function(age, is_m) {
+    idx <- which(eq5d_norms$age_lower <= age & eq5d_norms$age_upper >= age)
+    if (length(idx) == 0) idx <- nrow(eq5d_norms)
+    if (is_m) eq5d_norms$male[idx] else eq5d_norms$female[idx]
+  }
+
+  ages <- pmin(max_age, pmax(min_age, round(rnorm(n, mean_age, sd_age))))
+  is_male <- runif(n) < (pct_male / 100)
+  has_dm <- runif(n) < prev_dm
+  has_htn <- runif(n) < prev_htn
+  has_smoke <- runif(n) < prev_smoke
+
+  rr_mi <- rep(1, n); rr_stroke <- rep(1, n)
+  rr_mi[has_dm] <- rr_mi[has_dm] * rr_dm_mi
+  rr_mi[has_htn] <- rr_mi[has_htn] * rr_htn_mi
+  rr_mi[has_smoke] <- rr_mi[has_smoke] * rr_smoke_mi
+  rr_stroke[has_dm] <- rr_stroke[has_dm] * rr_dm_stroke
+  rr_stroke[has_htn] <- rr_stroke[has_htn] * rr_htn_stroke
+  rr_stroke[has_smoke] <- rr_stroke[has_smoke] * rr_smoke_stroke
+  rr_mi <- pmin(rr_mi, 10); rr_stroke <- pmin(rr_stroke, 10)
+
+  base_utility <- mapply(get_eq5d, ages, is_male)
+
+  data.frame(
+    id = 1:n, age = ages, is_male = is_male,
+    has_dm = has_dm, has_htn = has_htn, has_smoke = has_smoke,
+    rr_mi = rr_mi, rr_stroke = rr_stroke, base_utility = base_utility
+  )
+}
+
 # === BACKWARD-COMPATIBLE WRAPPER ===
-# This ensures existing DSA/PSA modules continue to work
+# Uses full v2 features by default (matching Shiny app behaviour)
 run_microsim_engine <- function(tp_list, costs_list, utils_list, n_pat = 1000,
                                  horizon = 30, disc_cost = 0.03, disc_util = 0.03,
-                                 seed = 123) {
+                                 seed = 123, patient_profiles = NULL) {
+  if (is.null(patient_profiles)) {
+    patient_profiles <- generate_default_profiles(n_pat, seed)
+  }
   run_microsim_engine_v2(tp_list, costs_list, utils_list, n_pat, horizon,
                           disc_cost, disc_util, seed,
-                          patient_profiles = NULL,
-                          use_heterogeneity = FALSE,
-                          use_adherence_decay = FALSE,
-                          use_age_mortality = FALSE,
-                          use_age_utilities = FALSE)
+                          patient_profiles = patient_profiles,
+                          use_heterogeneity = TRUE,
+                          use_adherence_decay = TRUE,
+                          use_age_mortality = TRUE,
+                          use_age_utilities = TRUE)
 }
