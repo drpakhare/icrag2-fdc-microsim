@@ -1,0 +1,28 @@
+# R session files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Posit Connect deployment artifacts
+rsconnect/
+manifest.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Lock files
+.~lock.*
+
+# Temporary files
+*.tmp
+*~
+
+# Non-app project files (keep local, not deployed)
+Literature/
+deploy/
+*.xlsx
+*.docx
+*.pdf
